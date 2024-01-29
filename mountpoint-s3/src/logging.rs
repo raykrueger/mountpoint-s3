@@ -17,6 +17,7 @@ use tracing_subscriber::filter::{EnvFilter, Filtered, LevelFilter};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry};
+use tracing_flame::FlameLayer;
 
 mod syslog;
 use self::syslog::SyslogLayer;
@@ -92,6 +93,9 @@ fn init_tracing_subscriber(config: LoggingConfig) -> anyhow::Result<()> {
 
     RustLogAdapter::try_init().context("failed to initialize CRT logger")?;
 
+    let (flame_layer, _guard) = FlameLayer::with_file("/var/log/mount-s3-tracing.folded").unwrap();
+
+
     let file_layer = if let Some(path) = &config.log_directory {
         const LOG_FILE_NAME_FORMAT: &[FormatItem<'static>] =
             macros::format_description!("mountpoint-s3-[year]-[month]-[day]T[hour]-[minute]-[second]Z.log");
@@ -142,6 +146,7 @@ fn init_tracing_subscriber(config: LoggingConfig) -> anyhow::Result<()> {
         .with(syslog_layer)
         .with(console_layer)
         .with(file_layer)
+        .with(flame_layer)
         .with(metrics_tracing_span_layer());
 
     registry.init();

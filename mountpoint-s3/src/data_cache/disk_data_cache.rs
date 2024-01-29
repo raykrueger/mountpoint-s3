@@ -351,6 +351,7 @@ fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
 }
 
 impl DataCache for DiskDataCache {
+
     fn get_block(
         &self,
         cache_key: &ObjectId,
