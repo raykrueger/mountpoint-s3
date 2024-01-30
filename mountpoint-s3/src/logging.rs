@@ -1,5 +1,5 @@
 use std::backtrace::Backtrace;
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::panic::{self, PanicInfo};
@@ -93,31 +93,22 @@ fn init_tracing_subscriber(config: LoggingConfig) -> anyhow::Result<()> {
 
     RustLogAdapter::try_init().context("failed to initialize CRT logger")?;
 
-    let (flame_layer, _guard) = FlameLayer::with_file("/var/log/mount-s3-tracing.folded").unwrap();
-
     let file_layer = if let Some(path) = &config.log_directory {
-        const LOG_FILE_NAME_FORMAT: &[FormatItem<'static>] =
-            macros::format_description!("mountpoint-s3-[year]-[month]-[day]T[hour]-[minute]-[second]Z.log");
-        let filename = OffsetDateTime::now_utc()
-            .format(LOG_FILE_NAME_FORMAT)
-            .context("couldn't format log file name")?;
-
-        // log directories and files created by Mountpoint should not be accessible by other users
-        let mut dir_builder = DirBuilder::new();
-        dir_builder.recursive(true).mode(0o750);
-        let mut file_options = OpenOptions::new();
-        file_options.mode(0o640).append(true).create(true);
-
-        dir_builder.create(path).context("failed to create log folder")?;
-        let file = file_options
-            .open(path.join(filename))
-            .context("failed to create log file")?;
+        let file = open_log_file(path, "log")?;
 
         let file_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(file)
             .with_filter(env_filter);
         Some(file_layer)
+    } else {
+        None
+    };
+
+    let flame_layer = if let Some(path) = &config.log_directory {
+        let file = open_log_file(path, "folded")?;
+        let flame_layer= FlameLayer::new(file);
+        Some(flame_layer)
     } else {
         None
     };
@@ -151,6 +142,27 @@ fn init_tracing_subscriber(config: LoggingConfig) -> anyhow::Result<()> {
     registry.init();
 
     Ok(())
+}
+
+fn open_log_file(path: &PathBuf, ext: &str) -> Result<File, anyhow::Error> {
+    const LOG_FILE_NAME_FORMAT: &[FormatItem<'static>] =
+        macros::format_description!("mountpoint-s3-[year]-[month]-[day]T[hour]-[minute]-[second]Z");
+    let base_name = OffsetDateTime::now_utc()
+        .format(LOG_FILE_NAME_FORMAT)
+        .context("couldn't format log file name")?;
+
+    let filename = format!("{}.{}", base_name, ext);
+
+    let mut dir_builder = DirBuilder::new();
+    dir_builder.recursive(true).mode(0o750);
+    let mut file_options = OpenOptions::new();
+    file_options.mode(0o640).append(true).create(true);
+    dir_builder.create(path).context("failed to create log folder")?;
+
+    let file = file_options
+        .open(path.join(filename))
+        .context("failed to create log file")?;
+    Ok(file)
 }
 
 pub fn record_name(name: &str) -> Span {
