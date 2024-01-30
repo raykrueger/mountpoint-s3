@@ -225,7 +225,7 @@ impl DiskDataCache {
         path
     }
 
-    #[instrument(skip(path))]
+    #[instrument(skip(path), level = "trace")]
     fn read_block(
         &self,
         path: impl AsRef<Path>,
@@ -364,7 +364,7 @@ fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
 
 impl DataCache for DiskDataCache {
 
-    #[instrument]
+    #[instrument(level = "trace")]
     fn get_block(
         &self,
         cache_key: &ObjectId,
