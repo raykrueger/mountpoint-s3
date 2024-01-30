@@ -65,3 +65,9 @@ DISABLED_LINTS += -A clippy::arc-with-non-send-sync  # https://github.com/propte
 clippy:
 	@packages=`echo "$(CRATES)" | sed -E 's/(^| )/ -p /g'`; \
 	cargo clippy $$packages --no-deps --all-targets --all-features -- -D warnings -D clippy::all $(DISABLED_LINTS)
+
+
+.PHONY: install
+install:
+	cargo build
+	sudo cp ./target/debug/mount-s3 /usr/bin/mount-s3

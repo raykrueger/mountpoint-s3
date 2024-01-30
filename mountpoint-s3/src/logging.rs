@@ -95,7 +95,6 @@ fn init_tracing_subscriber(config: LoggingConfig) -> anyhow::Result<()> {
 
     let (flame_layer, _guard) = FlameLayer::with_file("/var/log/mount-s3-tracing.folded").unwrap();
 
-
     let file_layer = if let Some(path) = &config.log_directory {
         const LOG_FILE_NAME_FORMAT: &[FormatItem<'static>] =
             macros::format_description!("mountpoint-s3-[year]-[month]-[day]T[hour]-[minute]-[second]Z.log");

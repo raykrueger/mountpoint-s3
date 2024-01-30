@@ -1,6 +1,7 @@
 //! Module for the on-disk data cache implementation.
 
 use std::fs;
+use std::hash::Hash;
 use std::io::{ErrorKind, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use mountpoint_s3_crt::checksums::crc32c::{self, Crc32c};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::{trace, warn};
+use tracing::{instrument, trace, trace_span, warn};
 
 use crate::checksums::IntegrityError;
 use crate::data_cache::DataCacheError;
@@ -28,6 +29,7 @@ const CACHE_VERSION: &str = "V1";
 const HASHED_DIR_SPLIT_INDEX: usize = 2;
 
 /// On-disk implementation of [DataCache].
+#[derive(Debug)]
 pub struct DiskDataCache {
     cache_directory: PathBuf,
     config: DiskDataCacheConfig,
@@ -223,6 +225,7 @@ impl DiskDataCache {
         path
     }
 
+    #[instrument(skip(path))]
     fn read_block(
         &self,
         path: impl AsRef<Path>,
@@ -230,11 +233,19 @@ impl DiskDataCache {
         block_idx: BlockIndex,
         block_offset: u64,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
-        let mut file = match fs::File::open(path.as_ref()) {
+
+        let file_open_span = trace_span!("file_open");
+        let file_open_start = Instant::now();
+
+        let mut file = match file_open_span.in_scope(|| {
+            fs::File::open(path.as_ref())
+        }) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
+
+        metrics::histogram!("read_block.file_open_duration_us", file_open_start.elapsed().as_micros() as f64);
 
         let mut block_version = [0; CACHE_VERSION.len()];
         file.read_exact(&mut block_version)?;
@@ -246,20 +257,49 @@ impl DiskDataCache {
             return Err(DataCacheError::InvalidBlockContent);
         }
 
-        let block: DiskBlock = match bincode::deserialize_from(&file) {
+        let deserialize_span = trace_span!("deserialize_block");
+
+        let header: DiskBlockHeader = match deserialize_span.in_scope(||
+            {bincode::deserialize_from(&file)
+        }) {
             Ok(block) => block,
             Err(e) => {
                 warn!("block could not be deserialized: {:?}", e);
                 return Err(DataCacheError::InvalidBlockContent);
             }
         };
-        let bytes = block
-            .data(cache_key, block_idx, block_offset)
+
+
+        let mut data_path = PathBuf::from(path.as_ref());
+        data_path.set_extension("dat");
+
+
+        let mut data_file = fs::File::open(data_path)?;
+        let mut data: Vec<u8> = vec!();
+        let _size = data_file.read_to_end(&mut data)?;
+
+        let checksum = header.validate(&header.s3_key, &header.etag, block_idx, block_offset).map_err(|err| match err {
+                DiskBlockAccessError::ChecksumError | DiskBlockAccessError::FieldMismatchError => {
+                    DataCacheError::InvalidBlockContent
+                }
+        })?;
+
+        let csb = ChecksummedBytes::new_from_inner_data(Bytes::from(data), checksum);
+        let block = match DiskBlock::new(cache_key.clone(), block_idx, block_offset, csb) {
+            Ok(block) => block,
+            Err(_) => return Err(DataCacheError::InvalidBlockContent)
+        };
+
+        let extract_data_span = trace_span!("extract_data");
+
+        let bytes = extract_data_span.in_scope(|| {
+            block.data(cache_key, block_idx, block_offset)
             .map_err(|err| match err {
                 DiskBlockAccessError::ChecksumError | DiskBlockAccessError::FieldMismatchError => {
                     DataCacheError::InvalidBlockContent
                 }
-            })?;
+            })
+        })?;
 
         Ok(Some(bytes))
     }
@@ -287,14 +327,32 @@ impl DiskDataCache {
             .mode(0o600)
             .open(path.as_ref())?;
         file.write_all(CACHE_VERSION.as_bytes())?;
-        let serialize_result = bincode::serialize_into(&mut file, &block);
+        let serialize_result = bincode::serialize_into(&mut file, &block.header);
         if let Err(err) = serialize_result {
             return match *err {
                 bincode::ErrorKind::Io(io_err) => return Err(DataCacheError::from(io_err)),
                 _ => Err(DataCacheError::InvalidBlockContent),
             };
         };
-        Ok(file.stream_position()? as usize)
+
+        let mut data_path = PathBuf::from(path.as_ref());
+        data_path.set_extension("dat");
+
+        trace!( "writing data block at {}", data_path.display());
+
+        let mut data_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(data_path)?;
+
+        let write_result = data_file.write_all(&block.data);
+        match write_result {
+            Ok(_) => Ok(data_file.stream_position()? as usize),
+            Err(e) => Err(DataCacheError::from(e)),
+        }
+
     }
 
     fn is_limit_exceeded(&self, size: usize) -> bool {
@@ -352,6 +410,7 @@ fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
 
 impl DataCache for DiskDataCache {
 
+    #[instrument]
     fn get_block(
         &self,
         cache_key: &ObjectId,
@@ -375,9 +434,14 @@ impl DataCache for DiskDataCache {
                 metrics::counter!("disk_data_cache.block_hit", 1);
                 metrics::counter!("disk_data_cache.total_bytes", bytes.len() as u64, "type" => "read");
                 metrics::histogram!("disk_data_cache.read_duration_us", start.elapsed().as_micros() as f64);
-                if let Some(usage) = &self.usage {
-                    usage.lock().unwrap().refresh(&block_key);
-                }
+
+                let lock_span = trace_span!("lock_span");
+                lock_span.in_scope(|| {
+                    if let Some(usage) = &self.usage {
+                        usage.lock().unwrap().refresh(&block_key);
+                    }
+                });
+                
                 Ok(Some(bytes))
             }
             Err(err) => {
@@ -483,7 +547,8 @@ impl DiskBlockKey {
 }
 
 /// Keeps track of entries usage and total size.
-struct UsageInfo<K> {
+#[derive(Debug)]
+struct UsageInfo<K: Eq + Hash> {
     entries: LinkedHashMap<K, usize>,
     size: usize,
 }

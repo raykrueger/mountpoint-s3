@@ -121,6 +121,7 @@ where
         // already likely negligible.
         let mut block_offset = block_range.start * block_size;
         for block_index in block_range.clone() {
+            let get_block_start = Instant::now();
             match self.cache.get_block(cache_key, block_index, block_offset) {
                 Ok(Some(block)) => {
                     trace!(?cache_key, ?range, block_index, "cache hit");
@@ -141,6 +142,7 @@ where
             // If a block is uncached or reading it fails, fallback to S3 for the rest of the stream.
             metrics::counter!("prefetch.blocks_served_from_cache", block_index - block_range.start);
             metrics::counter!("prefetch.blocks_requested_to_client", block_range.end - block_index);
+            metrics::histogram!("prefetch.get_block_duration_us", get_block_start.elapsed().as_micros() as f64);
             return self
                 .get_from_client(range.trim_start(block_offset), block_index..block_range.end)
                 .await;
