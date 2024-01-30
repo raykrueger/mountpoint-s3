@@ -233,22 +233,20 @@ impl DiskDataCache {
         block_idx: BlockIndex,
         block_offset: u64,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
-
-        let file_open_span = trace_span!("file_open");
-        let file_open_start = Instant::now();
-
-        let mut file = match file_open_span.in_scope(|| {
-            fs::File::open(path.as_ref())
-        }) {
+        let mut file = match fs::File::open(path.as_ref()) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
 
-        metrics::histogram!("read_block.file_open_duration_us", file_open_start.elapsed().as_micros() as f64);
+        let header_span = trace_span!("read_header");
 
         let mut block_version = [0; CACHE_VERSION.len()];
-        file.read_exact(&mut block_version)?;
+
+        header_span.in_scope(||{
+            file.read_exact(&mut block_version)
+        })?;
+
         if block_version != CACHE_VERSION.as_bytes() {
             warn!(
                 found_version = ?block_version, expected_version = ?CACHE_VERSION, path = ?path.as_ref(),
@@ -259,9 +257,7 @@ impl DiskDataCache {
 
         let deserialize_span = trace_span!("deserialize_block");
 
-        let header: DiskBlockHeader = match deserialize_span.in_scope(||
-            {bincode::deserialize_from(&file)
-        }) {
+        let block: DiskBlock = match deserialize_span.in_scope(|| {bincode::deserialize_from(&file)}) {
             Ok(block) => block,
             Err(e) => {
                 warn!("block could not be deserialized: {:?}", e);
@@ -269,37 +265,13 @@ impl DiskDataCache {
             }
         };
 
-
-        let mut data_path = PathBuf::from(path.as_ref());
-        data_path.set_extension("dat");
-
-
-        let mut data_file = fs::File::open(data_path)?;
-        let mut data: Vec<u8> = vec!();
-        let _size = data_file.read_to_end(&mut data)?;
-
-        let checksum = header.validate(&header.s3_key, &header.etag, block_idx, block_offset).map_err(|err| match err {
-                DiskBlockAccessError::ChecksumError | DiskBlockAccessError::FieldMismatchError => {
-                    DataCacheError::InvalidBlockContent
-                }
-        })?;
-
-        let csb = ChecksummedBytes::new_from_inner_data(Bytes::from(data), checksum);
-        let block = match DiskBlock::new(cache_key.clone(), block_idx, block_offset, csb) {
-            Ok(block) => block,
-            Err(_) => return Err(DataCacheError::InvalidBlockContent)
-        };
-
-        let extract_data_span = trace_span!("extract_data");
-
-        let bytes = extract_data_span.in_scope(|| {
-            block.data(cache_key, block_idx, block_offset)
+        let bytes = block
+            .data(cache_key, block_idx, block_offset)
             .map_err(|err| match err {
                 DiskBlockAccessError::ChecksumError | DiskBlockAccessError::FieldMismatchError => {
                     DataCacheError::InvalidBlockContent
                 }
-            })
-        })?;
+            })?;
 
         Ok(Some(bytes))
     }
@@ -327,32 +299,14 @@ impl DiskDataCache {
             .mode(0o600)
             .open(path.as_ref())?;
         file.write_all(CACHE_VERSION.as_bytes())?;
-        let serialize_result = bincode::serialize_into(&mut file, &block.header);
+        let serialize_result = bincode::serialize_into(&mut file, &block);
         if let Err(err) = serialize_result {
             return match *err {
                 bincode::ErrorKind::Io(io_err) => return Err(DataCacheError::from(io_err)),
                 _ => Err(DataCacheError::InvalidBlockContent),
             };
         };
-
-        let mut data_path = PathBuf::from(path.as_ref());
-        data_path.set_extension("dat");
-
-        trace!( "writing data block at {}", data_path.display());
-
-        let mut data_file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(data_path)?;
-
-        let write_result = data_file.write_all(&block.data);
-        match write_result {
-            Ok(_) => Ok(data_file.stream_position()? as usize),
-            Err(e) => Err(DataCacheError::from(e)),
-        }
-
+        Ok(file.stream_position()? as usize)
     }
 
     fn is_limit_exceeded(&self, size: usize) -> bool {
@@ -435,13 +389,12 @@ impl DataCache for DiskDataCache {
                 metrics::counter!("disk_data_cache.total_bytes", bytes.len() as u64, "type" => "read");
                 metrics::histogram!("disk_data_cache.read_duration_us", start.elapsed().as_micros() as f64);
 
-                let lock_span = trace_span!("lock_span");
-                lock_span.in_scope(|| {
+                let lock_span = trace_span!("lock_mutex");
+                lock_span.in_scope(||{
                     if let Some(usage) = &self.usage {
                         usage.lock().unwrap().refresh(&block_key);
                     }
                 });
-                
                 Ok(Some(bytes))
             }
             Err(err) => {
